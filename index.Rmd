@@ -1,0 +1,270 @@
+---
+title: "Detecting Common Lifting Errors from Tracker Data"
+author: "Matthew Halbasch"
+date: "March 31, 2019"
+output: html_document
+---
+
+## Overview
+
+Recent years have seen an explosion in the usage of fitness tracking devices to quantify the amount and type of exercise being done. 
+However, not much attention is given to quantifying how *well* an exercise is being performed.
+In this report, we use data from sensors on participants' arm, hand, belt and dumbell to classify whether a barbell exercise was performed correctly or falling into one of several common mistakes.
+We build a machine learning model to make this classification, and achieve an accuracy of 96% on a held-out testing set.
+These results rely on several sensors providing data simultaneously, complicating real-time detection, but remain promising for mistake detection in the future.
+
+```{r setup, include=FALSE}
+# Silence the code output until the appendix
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+```{r load_packages, message = FALSE}
+# Load the necessary packages
+library(tidyverse)
+library(caret)
+library(xtable)
+library(ggsci)
+
+```
+
+## Cleaning the Data
+
+The data for this project comes from the Weight Lifting Exercises Dataset avaialbe [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har).
+It consists of measurements from four sensors located on participants' belt, arm, hand, and barbell, measured during performance of a biceps curl.
+The experiment recorded six participants, each of whom performed the exercise in five distinct ways: 
+
+  * Correctly (Class A)
+  * Throwing elbows forward (Class B)
+  * Lifting the Dumbell only halfway (Class C)
+  * Lowering the Dumbell only halfway (Class D)
+  * Throwing hips forward (Class E)
+  
+Each sensor provides measurements for acceleration, gyroscope and magnetometer data along three axes.
+The [data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) used for this report includes these measurements as well as several calculated aggegrate features.
+These calculated features correspond to windows of measurements, aggregated by mean, standard deviation, maximum, etc.
+We have chosen to disregard these additional features in our analysis for later prediction purposes, so we may extrapolate from a single measurement on unseen data.
+
+Accordingly, we selected only the complete measurements at each time step as features, disregarding the window and time stamps.
+We were left with 52 features for prediction, with 19,622 complete observations.
+We split these observations into three distinct groups: a training set of 11,776 observations as well as a validation and quiz set, each containing 3,923 observations.
+
+
+```{r read_data, message = FALSE, warning = FALSE}
+# Read the raw data in directly from their urls
+training_url <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testing_url <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# Need to set the '#DIV/0!' entries to 'NA' for our analysis
+train_raw <- read_csv(training_url, na = c("", "NA", "#DIV/0!"))
+test_raw <- read_csv(testing_url, na = c("", "NA", "#DIV/0!"))
+
+```
+
+```{r clean_data}
+# Many columns are summary statistics for windows which we will not have 
+# available for the test set. These columns contain NA values, so we will
+# select only non-NA columns.
+not_any_na <- function(x) all(!is.na(x))
+
+# Additionally, we remove the labelling information including time and
+# user name from the feature space.
+train_raw  %>% select_if(not_any_na) %>% 
+  select(-c(X1, user_name, raw_timestamp_part_1, raw_timestamp_part_2, 
+            new_window, num_window, cvtd_timestamp)) -> train
+
+# Now we repeat the same actions for the testing dataset, also removing the
+# window number, as each observation occurs in a single window slice.
+test_raw %>% select_if(not_any_na) %>% 
+  select(-c(X1, user_name, raw_timestamp_part_1, raw_timestamp_part_2,
+            new_window, num_window, cvtd_timestamp)) -> test
+```
+
+```{r create_splits}
+# Now we will create the training, "quiz" and validation splits.
+# First we split the quiz from the rest of the data.
+
+set.seed(10120) # for reproducibility
+part <- createDataPartition(train$classe, p = 0.8)
+
+quiz <- train[-part$Resample1, ]
+not_quiz <- train[part$Resample1,]
+
+# Next, within the not_quiz set, we need to make a training and a validation
+# set. We are going for a 60/20/20 split, so we need 3/4 of the non-quiz set
+# for training.
+part2 <- createDataPartition(not_quiz$classe, p = .75)
+
+training <- not_quiz[part2$Resample1, ]
+validation <- not_quiz[-part2$Resample1, ]
+
+```
+
+## Building the Model
+
+The prediction model was built in three stages:
+
+* First, we split the training set with 10-fold cross-validation, and built a random forest classifier for each of these ten folds.
+
+* Second, we used the validation set to stack these 10 classifiers into a single classifier, again using a random forest model. This stacked model is trained on the validation set according to the original model's predictions, and is our final classifier.
+
+* We finally evaluated the performance of this stacked model on the quiz set to obtain a good estimate of the out-of-sample error of the model.
+
+This section examines each of these steps in detail.
+
+### Training Set Classifiers
+
+We first broke the training set into ten distinct folds, each approximately containing 1,178 observations.
+These folds were chosen randomly with the constraint that each of the five prediction classes are well-represented in each fold.
+
+```{r cross_validation, cache = TRUE}
+# We will next focus on just the training set, where we will use k-fold cross
+# validation. We use k = 10
+folds <- createFolds(training$classe, k = 10)
+
+# For each of these folds, we will train a random forest
+model_list <- list(0,0,0,0,0,0,0,0,0,0)
+set.seed(53210) # for reproducibility
+for(i in 1:length(folds)){
+  tr <- training[folds[[i]], ]
+  ts <- training[-folds[[i]], ]
+  
+  # We will try a few different values for ntree, using the test set to pick
+  # the best one in each cross-validation set.
+  ntrees <- c(50, 75, 100, 150, 200)
+  tree_list <- list(0,0,0,0,0)
+  for(j in 1:length(tree_list)){
+    n <- ntrees[j]
+    model <- train(classe ~ ., data = tr, method = "rf", ntree = n)
+    tree_list[[j]] <- model
+  }
+  
+  # Now we test our models on the ts set, and extract the accuracy
+  accs <- sapply(tree_list, 
+                 function(x) confusionMatrix(factor(predict(x, ts)),
+                                             factor(ts$classe))$overall[1])
+  
+  # Finally we take the model with the best accuracy
+  model_list[[i]] <- tree_list[[which(accs == max(accs))[1]]]
+}
+
+```
+
+We then training a random forest classifier on each fold, using the other nine folds as a validation set to decide the number of trees to use in each forest.
+We prioritized accuracy when deciding the number of trees to choose for the final model in each fold.
+This produced 10 different classifiers, each of which used between 75 and 200 trees.
+Their structure and validation performance are featured in the table below.
+
+```{r valid_table, results="asis"}
+# Here we produce a table summarising the 10 models and their accuracy
+validation_table <- data.frame(model = 1:10, ntree = rep(0,10), acc = rep(0,10))
+for(i in 1:length(model_list)){
+  model <- model_list[[i]]
+  ts <- training[-folds[[i]], ]
+  validation_table[i, 2] <- model$finalModel$ntree
+  validation_table[i, 3] <- confusionMatrix(factor(predict(model, ts)),
+                                            factor(ts$classe))$overall[1]
+}
+
+validation_table %>% rename(`Number of Trees` = ntree) %>%
+  mutate(acc = paste0(100*round(acc, 3), "%")) %>%
+  rename(`Validation Accuracy` = acc) %>%
+  xtable(align = c("c","c","c","c")) %>% 
+  print(type = "html", include.rownames = F)
+
+```
+
+We see that each of these models performs with over 90% accuracy on their validation sets, but this is not a good measure of out-of-sample error, as we have chosen the number of trees to maximize the accuracy in each case.
+We next look at how we measured and improved the out-of-sample error of these predictors.
+
+### Stacking the Classifiers
+
+We next used the validation set described beforehand to estimate the out-of-sample error of these 10 predictors.
+To improve on this error, we 'stacked' the classifiers by using their predictions on the validation set as features for a new random forest model to be trained on the validation set.
+That is, our stacked classifier takes the predictions from our ten models as input, and outputs its own classification, trained according to the actual labels of the validation set.
+
+```{r stacking, cache = TRUE}
+# Now we take each of our 10 models selected in cross-validation, and 
+# use them to predict the validation set.
+preds <- sapply(model_list, function(x) predict(x, validation))
+pred_df <- cbind(as.data.frame(preds), actual = validation$classe)
+
+# Next we stack these 10 models using a random forest to create a final model
+set.seed(8401) # for reproducibility
+final_model <- train(actual ~ ., data = pred_df, method = "rf", ntree = 100)
+
+```
+
+We chose to use 100 trees for this stacked random forest, and it achieved a 99% accuracy on the validation set (its training set, so this does not estimate the out-of-sample error).
+
+### Testing the Stacked Model
+
+Finally, to get a true estimate of the out-of-sample error of the final model, we evaluated its performance on the quiz set.
+To illustrate its performance relative to the 10 individual classifiers we have briefly summarised their accuracy on this set in the table below.
+
+```{r stack_table, results = "asis"}
+# Finally, we apply this model to the quiz set
+quiz_pred_df <- as.data.frame(sapply(model_list, function(x) predict(x, quiz)))
+quiz_preds <- predict(final_model, quiz_pred_df)
+
+# We want to compare the accuracies, so we calculate the accuracy for each model
+accs <- apply(quiz_pred_df, MARGIN = 2, 
+              function(x) confusionMatrix(factor(x), 
+                                          factor(quiz$classe))$overall[1])
+
+final_acc <- confusionMatrix(factor(quiz_preds),
+                             factor(quiz$classe))$overall[1]
+
+# Now we organize these into a table
+stack_table <- data.frame(model = as.character(1:10), acc = accs,
+                          stringsAsFactors = FALSE)
+stack_table <- rbind(stack_table, list("Stacked", final_acc))
+
+stack_table %>% mutate(acc = paste0(100*round(acc, 3), "%")) %>%
+  rename(`Quiz Accuracy` = acc) %>%
+  xtable(align = c("c","c","c")) %>% 
+  print(type = "html", include.rownames = F)
+
+```
+
+We see that the stacked classifier achieves a significantly better accuracy than any of the individual classifiers, with 96.3% accuracy on the quiz set.
+We expect that this will be a good measure of the out-of-sample error for this classifier, as it was trained with no information about the quiz set.
+
+Focusing on this stacked classifier in particular, we have provided the confusion matrix on the quiz set in both table and figure form below.
+
+```{r confusion_matrix_table, comment=""}
+# First we output the table from the confusion matrix
+confusion_matrix <- confusionMatrix(factor(quiz_preds), factor(quiz$classe))
+confusion_matrix$table
+
+```
+
+```{r confusion_matrix_plot}
+# Next we create a visualization of the confusion matrix
+results <- data.frame(pred = quiz_preds, actual = quiz$classe)
+
+ggplot(results, aes(x = actual, y = pred, color = actual)) + 
+  geom_jitter(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Predicted Verus Actual Classification") +
+  xlab("Actual Classification") +
+  ylab("Predicted Classification") +
+  theme(legend.title = element_blank()) + 
+  scale_color_nejm()
+```
+
+We see from the confusion matrix that the classifier is reasonably consistent between classes, with similar error rates between each class.
+Note also that it is especially accurate at identifying class A, corresponding to correctly performing the exercise.
+For the purposes of mistake detection, this is an especially important point, and a success of our model.
+
+## Conclusion
+
+Using a stacked random forest model, we are able to identify with an estimated 96% accuracy the form of exercise being performed.
+This was accomplished with only raw data output from four sensors, offering hope that future advancements can turn this type of analysis into real-time feedback.
+This can help bring the use of technology in fitness from telling us how much we have done to informing *how* we do our exercises.
+
+
+
+## Code Appendix
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+```
